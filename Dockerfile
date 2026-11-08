@@ -32,7 +32,7 @@ USER botuser
 # Default environment variables
 ENV HOST=ayx.acido.dev \
     MINECRAFT_PORT=19132 \
-    BOT_NAME=IronBot \
+    BOT_NAME=IronBot,IronBot2 \
     TRANSPORT=nethernet \
     GAME_VERSION=1.26.61 \
     AUTH_INPUT=false
