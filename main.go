@@ -21,19 +21,32 @@ import (
 func main() {
 	host := flag.String("host", "ayx.acido.dev", "BDS server host or IP")
 	port := flag.Int("port", 19132, "BDS server port")
-	name := flag.String("name", "IronBot", "Bot player display name")
+	name := flag.String("name", "IronBot,IronBot2", "Comma-separated bot player display name(s)")
 	transport := flag.String("transport", "nethernet", "Transport network: 'nethernet' or 'raknet'")
 	gameVersion := flag.String("game-version", "1.26.61", "Game version string reported to server")
 	authInput := flag.Bool("auth-input", false, "Send 20Hz PlayerAuthInput packets to simulate active movement")
 	flag.Parse()
 
 	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds)
-	log.Printf("[IronBot] Starting AFK Player Bot for Minecraft Bedrock")
-	log.Printf("[IronBot] Target: %s:%d (Transport: %s, Offline Account: %s)", *host, *port, *transport, *name)
+
+	// Parse bot names (allows running 1 or multiple bots concurrently)
+	var botNames []string
+	for _, n := range strings.Split(*name, ",") {
+		n = strings.TrimSpace(n)
+		if n != "" {
+			botNames = append(botNames, n)
+		}
+	}
+	if len(botNames) == 0 {
+		botNames = []string{"IronBot"}
+	}
+
+	log.Printf("[System] Starting AFK Player Bot(s) for Minecraft Bedrock: %s", strings.Join(botNames, ", "))
+	log.Printf("[System] Target: %s:%d (Transport: %s, GameVersion: %s)", *host, *port, *transport, *gameVersion)
 	if *authInput {
-		log.Printf("[IronBot] PlayerAuthInput is ENABLED (transmitting 20Hz active player input)")
+		log.Printf("[System] PlayerAuthInput is ENABLED (transmitting 20Hz active player input)")
 	} else {
-		log.Printf("[IronBot] PlayerAuthInput is DISABLED (idle client packet loop)")
+		log.Printf("[System] PlayerAuthInput is DISABLED (idle client packet loop)")
 	}
 
 	// Start lightweight HTTP health-check server for cloud hosting & keep-alive pings
@@ -45,9 +58,9 @@ func main() {
 		mux := http.NewServeMux()
 		mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusOK)
-			_, _ = fmt.Fprintf(w, "IronBot is active and running!\n")
+			_, _ = fmt.Fprintf(w, "AFK Bots are active: %s\n", strings.Join(botNames, ", "))
 		})
-		log.Printf("[IronBot] Health check web server listening on port :%s", webPort)
+		log.Printf("[System] Health check web server listening on port :%s", webPort)
 		_ = http.ListenAndServe(":"+webPort, mux)
 	}()
 
@@ -55,35 +68,62 @@ func main() {
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 
+	// Run all bots concurrently
+	var wg sync.WaitGroup
+	for _, bName := range botNames {
+		wg.Add(1)
+		go func(botName string) {
+			defer wg.Done()
+			runBotLoop(*host, *port, *transport, botName, *gameVersion, *authInput, sigChan)
+		}(bName)
+	}
+
+	// Wait for shutdown signal
+	<-sigChan
+	log.Printf("[System] Shutdown signal received. Waiting for bots to disconnect cleanly...")
+	wg.Wait()
+	log.Printf("[System] All bots stopped. Exiting.")
+}
+
+// runBotLoop runs the reconnect loop for an individual bot.
+func runBotLoop(host string, port int, transport string, botName string, gameVersion string, enableAuthInput bool, sigChan <-chan os.Signal) {
+	prefix := fmt.Sprintf("[%s]", botName)
 	backoff := 5 * time.Second
 	const maxBackoff = 120 * time.Second // 2 minute cap
 
 	for {
 		connectedAt := time.Now()
-		log.Printf("[IronBot] Dialing server (%s) over %s...", fmt.Sprintf("%s:%d", *host, *port), *transport)
+		log.Printf("%s Dialing server (%s:%d) over %s...", prefix, host, port, transport)
 
-		err := runBotSession(*host, *port, *transport, *name, *gameVersion, *authInput, sigChan)
+		err := runBotSession(host, port, transport, botName, gameVersion, enableAuthInput, sigChan)
 		if err != nil {
-			log.Printf("[IronBot] Session ended with error: %v", err)
+			log.Printf("%s Session ended with error: %v", prefix, err)
 		} else {
-			log.Printf("[IronBot] Session terminated normally or shutdown signal received")
+			log.Printf("%s Session terminated normally or shutdown signal received", prefix)
 			return
 		}
 
-		// If connected for at least 30 seconds before disconnecting, reset backoff
+		// Check if shutdown was requested
+		select {
+		case <-sigChan:
+			log.Printf("%s Stopping bot loop on shutdown signal", prefix)
+			return
+		default:
+		}
+
+		// Reset backoff if session stayed connected for at least 30 seconds
 		if time.Since(connectedAt) > 30*time.Second {
 			backoff = 5 * time.Second
 		}
 
-		log.Printf("[IronBot] Reconnecting in %v (capped at %v)...", backoff, maxBackoff)
+		log.Printf("%s Reconnecting in %v (capped at %v)...", prefix, backoff, maxBackoff)
 		select {
 		case <-sigChan:
-			log.Printf("[IronBot] Shutdown signal received during backoff. Exiting.")
+			log.Printf("%s Shutdown signal received during backoff. Exiting.", prefix)
 			return
 		case <-time.After(backoff):
 		}
 
-		// Exponential backoff
 		backoff *= 2
 		if backoff > maxBackoff {
 			backoff = maxBackoff
@@ -91,8 +131,9 @@ func main() {
 	}
 }
 
-// runBotSession handles a single connection lifecycle.
+// runBotSession handles a single connection lifecycle for a bot.
 func runBotSession(host string, port int, transport string, botName string, gameVersion string, enableAuthInput bool, sigChan <-chan os.Signal) error {
+	prefix := fmt.Sprintf("[%s]", botName)
 	dialer := minecraft.Dialer{
 		IdentityData: login.IdentityData{
 			DisplayName: botName,
@@ -108,7 +149,6 @@ func runBotSession(host string, port int, transport string, botName string, game
 	switch strings.ToLower(transport) {
 	case "nethernet":
 		network = "nethernet"
-		// NetherNet requires an HTTP signaling address URL with port
 		if strings.HasPrefix(host, "http://") || strings.HasPrefix(host, "https://") {
 			address = fmt.Sprintf("%s:%d", host, port)
 		} else {
@@ -124,24 +164,24 @@ func runBotSession(host string, port int, transport string, botName string, game
 	dialCtx, dialCancel := context.WithTimeout(context.Background(), 25*time.Second)
 	defer dialCancel()
 
-	log.Printf("[IronBot] Connecting to %s [%s]...", address, network)
+	log.Printf("%s Connecting to %s [%s]...", prefix, address, network)
 	conn, err := dialer.DialContext(dialCtx, network, address)
 	if err != nil {
 		return fmt.Errorf("connection failed: %w", err)
 	}
 	defer conn.Close()
 
-	log.Printf("[IronBot] Connected to %s. Handshaking and completing spawn sequence (DoSpawn)...", conn.RemoteAddr())
+	log.Printf("%s Connected to %s. Handshaking and completing spawn sequence (DoSpawn)...", prefix, conn.RemoteAddr())
 	if err := conn.DoSpawn(); err != nil {
 		return fmt.Errorf("spawn sequence (DoSpawn) failed: %w", err)
 	}
 
 	gameData := conn.GameData()
-	log.Printf("[IronBot] SPAWN SUCCESS! World: '%s', Dimension: %d, Difficulty: %d",
-		gameData.WorldName, gameData.Dimension, gameData.Difficulty)
-	log.Printf("[IronBot] Bot Runtime Entity ID: %d, Spawn Coordinates: X=%.2f, Y=%.2f, Z=%.2f",
-		gameData.EntityRuntimeID, gameData.PlayerPosition.X(), gameData.PlayerPosition.Y(), gameData.PlayerPosition.Z())
-	log.Printf("[IronBot] Bot is now active in server player list. Waiting for incoming packets / commands...")
+	log.Printf("%s SPAWN SUCCESS! World: '%s', Dimension: %d, Difficulty: %d",
+		prefix, gameData.WorldName, gameData.Dimension, gameData.Difficulty)
+	log.Printf("%s Bot Runtime Entity ID: %d, Spawn Coordinates: X=%.2f, Y=%.2f, Z=%.2f",
+		prefix, gameData.EntityRuntimeID, gameData.PlayerPosition.X(), gameData.PlayerPosition.Y(), gameData.PlayerPosition.Z())
+	log.Printf("%s Bot is now active in server player list. Waiting for incoming packets / commands...", prefix)
 
 	var posMu sync.RWMutex
 	currentPos := gameData.PlayerPosition
@@ -152,7 +192,7 @@ func runBotSession(host string, port int, transport string, botName string, game
 	stopAuthInput := make(chan struct{})
 	defer close(stopAuthInput)
 
-	// Optional 20Hz PlayerAuthInput loop to simulate player inputs
+	// Optional 20Hz PlayerAuthInput loop
 	if enableAuthInput {
 		go func() {
 			ticker := time.NewTicker(50 * time.Millisecond) // 20 ticks / second
@@ -182,7 +222,6 @@ func runBotSession(host string, port int, transport string, botName string, game
 						InteractionModel: packet.InteractionModelClassic,
 					}
 					if err := conn.WritePacket(input); err != nil {
-						// Write error means connection dropped
 						return
 					}
 				}
@@ -190,7 +229,6 @@ func runBotSession(host string, port int, transport string, botName string, game
 		}()
 	}
 
-	// Read packets in a loop to keep the connection healthy and track updates
 	readErrChan := make(chan error, 1)
 	go func() {
 		for {
@@ -208,23 +246,18 @@ func runBotSession(host string, port int, transport string, botName string, game
 					currentPitch = p.Pitch
 					currentYaw = p.Yaw
 					posMu.Unlock()
-					log.Printf("[IronBot] Position updated by server (/tp or move): X=%.2f, Y=%.2f, Z=%.2f (Yaw=%.1f)",
-						p.Position.X(), p.Position.Y(), p.Position.Z(), p.Yaw)
+					log.Printf("%s Position updated by server (/tp or move): X=%.2f, Y=%.2f, Z=%.2f (Yaw=%.1f)",
+						prefix, p.Position.X(), p.Position.Y(), p.Position.Z(), p.Yaw)
 				}
 			case *packet.Disconnect:
-				log.Printf("[IronBot] Server sent Disconnect packet: %s", p.Message)
-			case *packet.Text:
-				if p.TextType == packet.TextTypeChat || p.TextType == packet.TextTypeTranslation {
-					// Optionally log chat messages if relevant
-					// log.Printf("[Chat] %s: %s", p.SourceName, p.Message)
-				}
+				log.Printf("%s Server sent Disconnect packet: %s", prefix, p.Message)
 			}
 		}
 	}()
 
 	select {
 	case sig := <-sigChan:
-		log.Printf("[IronBot] Received signal %v. Disconnecting cleanly...", sig)
+		log.Printf("%s Received signal %v. Disconnecting cleanly...", prefix, sig)
 		return nil
 	case err := <-readErrChan:
 		return fmt.Errorf("read packet loop ended: %w", err)
