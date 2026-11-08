@@ -31,10 +31,10 @@ USER botuser
 
 # Default environment variables
 ENV HOST=ayx.acido.dev \
-    PORT=19132 \
+    MINECRAFT_PORT=19132 \
     BOT_NAME=IronBot \
     TRANSPORT=nethernet \
     GAME_VERSION=1.26.61 \
     AUTH_INPUT=false
 
-ENTRYPOINT ["sh", "-c", "exec /usr/local/bin/ironbot -host \"$HOST\" -port \"$PORT\" -name \"$BOT_NAME\" -transport \"$TRANSPORT\" -game-version \"$GAME_VERSION\" -auth-input=$AUTH_INPUT"]
+ENTRYPOINT ["sh", "-c", "exec /usr/local/bin/ironbot -host \"$HOST\" -port \"$MINECRAFT_PORT\" -name \"$BOT_NAME\" -transport \"$TRANSPORT\" -game-version \"$GAME_VERSION\" -auth-input=$AUTH_INPUT"]

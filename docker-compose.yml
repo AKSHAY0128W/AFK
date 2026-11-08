@@ -5,7 +5,7 @@ services:
     restart: unless-stopped
     environment:
       - HOST=ayx.acido.dev
-      - PORT=19132
+      - MINECRAFT_PORT=19132
       - BOT_NAME=IronBot
       - TRANSPORT=nethernet
       - GAME_VERSION=1.26.61
