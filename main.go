@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/sandertv/gophertunnel/minecraft"
 	"github.com/sandertv/gophertunnel/minecraft/protocol/login"
 	"github.com/sandertv/gophertunnel/minecraft/protocol/packet"
@@ -29,7 +30,6 @@ func main() {
 
 	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds)
 
-	// Parse bot names (allows running 1 or multiple bots concurrently)
 	var botNames []string
 	for _, n := range strings.Split(*name, ",") {
 		n = strings.TrimSpace(n)
@@ -49,7 +49,6 @@ func main() {
 		log.Printf("[System] PlayerAuthInput is DISABLED (idle client packet loop)")
 	}
 
-	// Start lightweight HTTP health-check server for cloud hosting & keep-alive pings
 	webPort := os.Getenv("PORT")
 	if webPort == "" {
 		webPort = "8080"
@@ -64,32 +63,36 @@ func main() {
 		_ = http.ListenAndServe(":"+webPort, mux)
 	}()
 
-	// Capture interrupt signals for graceful shutdown
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 
-	// Run all bots concurrently
 	var wg sync.WaitGroup
-	for _, bName := range botNames {
+	for i, bName := range botNames {
 		wg.Add(1)
-		go func(botName string) {
+		delay := time.Duration(i*3) * time.Second
+		go func(botName string, startDelay time.Duration) {
 			defer wg.Done()
+			if startDelay > 0 {
+				select {
+				case <-sigChan:
+					return
+				case <-time.After(startDelay):
+				}
+			}
 			runBotLoop(*host, *port, *transport, botName, *gameVersion, *authInput, sigChan)
-		}(bName)
+		}(bName, delay)
 	}
 
-	// Wait for shutdown signal
 	<-sigChan
 	log.Printf("[System] Shutdown signal received. Waiting for bots to disconnect cleanly...")
 	wg.Wait()
 	log.Printf("[System] All bots stopped. Exiting.")
 }
 
-// runBotLoop runs the reconnect loop for an individual bot.
 func runBotLoop(host string, port int, transport string, botName string, gameVersion string, enableAuthInput bool, sigChan <-chan os.Signal) {
 	prefix := fmt.Sprintf("[%s]", botName)
 	backoff := 5 * time.Second
-	const maxBackoff = 120 * time.Second // 2 minute cap
+	const maxBackoff = 120 * time.Second
 
 	for {
 		connectedAt := time.Now()
@@ -103,7 +106,6 @@ func runBotLoop(host string, port int, transport string, botName string, gameVer
 			return
 		}
 
-		// Check if shutdown was requested
 		select {
 		case <-sigChan:
 			log.Printf("%s Stopping bot loop on shutdown signal", prefix)
@@ -111,7 +113,6 @@ func runBotLoop(host string, port int, transport string, botName string, gameVer
 		default:
 		}
 
-		// Reset backoff if session stayed connected for at least 30 seconds
 		if time.Since(connectedAt) > 30*time.Second {
 			backoff = 5 * time.Second
 		}
@@ -131,12 +132,16 @@ func runBotLoop(host string, port int, transport string, botName string, gameVer
 	}
 }
 
-// runBotSession handles a single connection lifecycle for a bot.
 func runBotSession(host string, port int, transport string, botName string, gameVersion string, enableAuthInput bool, sigChan <-chan os.Signal) error {
 	prefix := fmt.Sprintf("[%s]", botName)
+
+	// Fixed deterministic UUID per bot name so BDS always maps player files consistently
+	botUUID := uuid.NewSHA1(uuid.NameSpaceDNS, []byte("OfflinePlayer:"+botName)).String()
+
 	dialer := minecraft.Dialer{
 		IdentityData: login.IdentityData{
 			DisplayName: botName,
+			Identity:    botUUID,
 		},
 		ClientData: login.ClientData{
 			GameVersion: gameVersion,
@@ -164,7 +169,7 @@ func runBotSession(host string, port int, transport string, botName string, game
 	dialCtx, dialCancel := context.WithTimeout(context.Background(), 25*time.Second)
 	defer dialCancel()
 
-	log.Printf("%s Connecting to %s [%s]...", prefix, address, network)
+	log.Printf("%s Connecting to %s [%s] (UUID: %s)...", prefix, address, network, botUUID)
 	conn, err := dialer.DialContext(dialCtx, network, address)
 	if err != nil {
 		return fmt.Errorf("connection failed: %w", err)
@@ -181,7 +186,6 @@ func runBotSession(host string, port int, transport string, botName string, game
 		prefix, gameData.WorldName, gameData.Dimension, gameData.Difficulty)
 	log.Printf("%s Bot Runtime Entity ID: %d, Spawn Coordinates: X=%.2f, Y=%.2f, Z=%.2f",
 		prefix, gameData.EntityRuntimeID, gameData.PlayerPosition.X(), gameData.PlayerPosition.Y(), gameData.PlayerPosition.Z())
-	log.Printf("%s Bot is now active in server player list. Waiting for incoming packets / commands...", prefix)
 
 	var posMu sync.RWMutex
 	currentPos := gameData.PlayerPosition
@@ -192,10 +196,9 @@ func runBotSession(host string, port int, transport string, botName string, game
 	stopAuthInput := make(chan struct{})
 	defer close(stopAuthInput)
 
-	// Optional 20Hz PlayerAuthInput loop
 	if enableAuthInput {
 		go func() {
-			ticker := time.NewTicker(50 * time.Millisecond) // 20 ticks / second
+			ticker := time.NewTicker(50 * time.Millisecond)
 			defer ticker.Stop()
 			var tickCount uint64
 
