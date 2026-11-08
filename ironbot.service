@@ -1,0 +1,22 @@
+[Unit]
+Description=IronBot Minecraft Bedrock AFK Player Client
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=nobody
+Group=nogroup
+WorkingDirectory=/opt/ironbot
+ExecStart=/opt/ironbot/ironbot -host ayx.acido.dev -port 19132 -name IronBot -transport nethernet -game-version 1.26.61 -auth-input=false
+Restart=always
+RestartSec=5s
+
+# Hardening / Isolation
+ProtectSystem=strict
+ProtectHome=true
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

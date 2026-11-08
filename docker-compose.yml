@@ -1,0 +1,17 @@
+services:
+  ironbot:
+    build: .
+    container_name: ironbot-afk
+    restart: unless-stopped
+    environment:
+      - HOST=ayx.acido.dev
+      - PORT=19132
+      - BOT_NAME=IronBot
+      - TRANSPORT=nethernet
+      - GAME_VERSION=1.26.61
+      - AUTH_INPUT=false
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
