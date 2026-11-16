@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
@@ -19,96 +21,138 @@ import (
 	"github.com/sandertv/gophertunnel/minecraft/protocol/packet"
 )
 
-func main() {
-	host := flag.String("host", "ayx.acido.dev", "BDS server host or IP")
-	port := flag.Int("port", 19132, "BDS server port")
-	name := flag.String("name", "IronBot,IronBot2", "Comma-separated bot player display name(s)")
-	transport := flag.String("transport", "nethernet", "Transport network: 'nethernet' or 'raknet'")
-	gameVersion := flag.String("game-version", "1.26.61", "Game version string reported to server")
-	authInput := flag.Bool("auth-input", false, "Send 20Hz PlayerAuthInput packets to simulate active movement")
-	flag.Parse()
-
-	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds)
-
-	var botNames []string
-	for _, n := range strings.Split(*name, ",") {
-		n = strings.TrimSpace(n)
-		if n != "" {
-			botNames = append(botNames, n)
-		}
-	}
-	if len(botNames) == 0 {
-		botNames = []string{"IronBot"}
-	}
-
-	log.Printf("[System] Starting AFK Player Bot(s) for Minecraft Bedrock: %s", strings.Join(botNames, ", "))
-	log.Printf("[System] Target: %s:%d (Transport: %s, GameVersion: %s)", *host, *port, *transport, *gameVersion)
-	if *authInput {
-		log.Printf("[System] PlayerAuthInput is ENABLED (transmitting 20Hz active player input)")
-	} else {
-		log.Printf("[System] PlayerAuthInput is DISABLED (idle client packet loop)")
-	}
-
-	webPort := os.Getenv("PORT")
-	if webPort == "" {
-		webPort = "8080"
-	}
-	go func() {
-		mux := http.NewServeMux()
-		mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-			w.WriteHeader(http.StatusOK)
-			_, _ = fmt.Fprintf(w, "AFK Bots are active: %s\n", strings.Join(botNames, ", "))
-		})
-		log.Printf("[System] Health check web server listening on port :%s", webPort)
-		_ = http.ListenAndServe(":"+webPort, mux)
-	}()
-
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
-
-	var wg sync.WaitGroup
-	for i, bName := range botNames {
-		wg.Add(1)
-		delay := time.Duration(i*3) * time.Second
-		go func(botName string, startDelay time.Duration) {
-			defer wg.Done()
-			if startDelay > 0 {
-				select {
-				case <-sigChan:
-					return
-				case <-time.After(startDelay):
-				}
-			}
-			runBotLoop(*host, *port, *transport, botName, *gameVersion, *authInput, sigChan)
-		}(bName, delay)
-	}
-
-	<-sigChan
-	log.Printf("[System] Shutdown signal received. Waiting for bots to disconnect cleanly...")
-	wg.Wait()
-	log.Printf("[System] All bots stopped. Exiting.")
+// BotManager dynamically orchestrates active bot workers in goroutines
+type BotManager struct {
+	mu           sync.Mutex
+	workers      map[string]context.CancelFunc
+	rootCtx      context.Context
+	host         string
+	port         int
+	transport    string
+	gameVersion  string
+	authInput    bool
+	ctrlCenter   string
 }
 
-func runBotLoop(host string, port int, transport string, botName string, gameVersion string, enableAuthInput bool, sigChan <-chan os.Signal) {
+func NewBotManager(ctx context.Context, host string, port int, transport string, version string, authInput bool, ctrlCenter string) *BotManager {
+	return &BotManager{
+		workers:     make(map[string]context.CancelFunc),
+		rootCtx:     ctx,
+		host:        host,
+		port:        port,
+		transport:   transport,
+		gameVersion: version,
+		authInput:   authInput,
+		ctrlCenter:  strings.TrimRight(ctrlCenter, "/"),
+	}
+}
+
+// ActiveBotNames returns a sorted/clean list of currently active bot names
+func (bm *BotManager) ActiveBotNames() []string {
+	bm.mu.Lock()
+	defer bm.mu.Unlock()
+	var names []string
+	for name := range bm.workers {
+		names = append(names, name)
+	}
+	return names
+}
+
+// Sync updates the running bot pool to match the desired list exactly
+func (bm *BotManager) Sync(desiredNames []string) {
+	bm.mu.Lock()
+	defer bm.mu.Unlock()
+
+	desiredMap := make(map[string]bool)
+	for _, n := range desiredNames {
+		n = strings.TrimSpace(n)
+		if n != "" {
+			desiredMap[n] = true
+		}
+	}
+
+	// 1. Stop any bots that are no longer in the desired list
+	for name, cancel := range bm.workers {
+		if !desiredMap[name] {
+			log.Printf("[BotManager] Stopping removed bot: %s", name)
+			cancel()
+			delete(bm.workers, name)
+		}
+	}
+
+	// 2. Start any new bots that are not yet running
+	for name := range desiredMap {
+		if _, running := bm.workers[name]; !running {
+			log.Printf("[BotManager] Launching new dynamic bot worker: %s", name)
+			botCtx, botCancel := context.WithCancel(bm.rootCtx)
+			bm.workers[name] = botCancel
+
+			go bm.runBotWorker(botCtx, name)
+		}
+	}
+}
+
+// StopBot cancels a specific bot by name
+func (bm *BotManager) StopBot(name string) bool {
+	bm.mu.Lock()
+	defer bm.mu.Unlock()
+	if cancel, exists := bm.workers[name]; exists {
+		log.Printf("[BotManager] Manually stopping bot: %s", name)
+		cancel()
+		delete(bm.workers, name)
+		return true
+	}
+	return false
+}
+
+// StartBot launches a single bot if not already running
+func (bm *BotManager) StartBot(name string) bool {
+	bm.mu.Lock()
+	defer bm.mu.Unlock()
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return false
+	}
+	if _, exists := bm.workers[name]; exists {
+		return false // already running
+	}
+	log.Printf("[BotManager] Starting single bot: %s", name)
+	botCtx, botCancel := context.WithCancel(bm.rootCtx)
+	bm.workers[name] = botCancel
+	go bm.runBotWorker(botCtx, name)
+	return true
+}
+
+func (bm *BotManager) runBotWorker(ctx context.Context, botName string) {
 	prefix := fmt.Sprintf("[%s]", botName)
 	backoff := 5 * time.Second
 	const maxBackoff = 120 * time.Second
 
 	for {
-		connectedAt := time.Now()
-		log.Printf("%s Dialing server (%s:%d) over %s...", prefix, host, port, transport)
+		select {
+		case <-ctx.Done():
+			log.Printf("%s Bot worker canceled or removed. Disconnecting cleanly.", prefix)
+			bm.reportTelemetry(botName, "offline", 0, 0, 0, 0, 0, "")
+			return
+		default:
+		}
 
-		err := runBotSession(host, port, transport, botName, gameVersion, enableAuthInput, sigChan)
+		connectedAt := time.Now()
+		log.Printf("%s Dialing server (%s:%d) over %s...", prefix, bm.host, bm.port, bm.transport)
+		bm.reportTelemetry(botName, "connecting", 0, 0, 0, 0, 0, "")
+
+		err := bm.runBotSession(ctx, botName)
 		if err != nil {
 			log.Printf("%s Session ended with error: %v", prefix, err)
+			bm.reportTelemetry(botName, "reconnecting", 0, 0, 0, 0, 0, err.Error())
 		} else {
-			log.Printf("%s Session terminated normally or shutdown signal received", prefix)
+			log.Printf("%s Session terminated cleanly.", prefix)
+			bm.reportTelemetry(botName, "offline", 0, 0, 0, 0, 0, "")
 			return
 		}
 
 		select {
-		case <-sigChan:
-			log.Printf("%s Stopping bot loop on shutdown signal", prefix)
+		case <-ctx.Done():
 			return
 		default:
 		}
@@ -119,8 +163,7 @@ func runBotLoop(host string, port int, transport string, botName string, gameVer
 
 		log.Printf("%s Reconnecting in %v (capped at %v)...", prefix, backoff, maxBackoff)
 		select {
-		case <-sigChan:
-			log.Printf("%s Shutdown signal received during backoff. Exiting.", prefix)
+		case <-ctx.Done():
 			return
 		case <-time.After(backoff):
 		}
@@ -132,10 +175,9 @@ func runBotLoop(host string, port int, transport string, botName string, gameVer
 	}
 }
 
-func runBotSession(host string, port int, transport string, botName string, gameVersion string, enableAuthInput bool, sigChan <-chan os.Signal) error {
+func (bm *BotManager) runBotSession(ctx context.Context, botName string) error {
 	prefix := fmt.Sprintf("[%s]", botName)
 
-	// Fixed deterministic UUID per bot name so BDS always maps player files consistently
 	botUUID := uuid.NewSHA1(uuid.NameSpaceDNS, []byte("OfflinePlayer:"+botName)).String()
 
 	dialer := minecraft.Dialer{
@@ -144,29 +186,29 @@ func runBotSession(host string, port int, transport string, botName string, game
 			Identity:    botUUID,
 		},
 		ClientData: login.ClientData{
-			GameVersion: gameVersion,
+			GameVersion: bm.gameVersion,
 		},
 	}
 
 	var address string
 	var network string
 
-	switch strings.ToLower(transport) {
+	switch strings.ToLower(bm.transport) {
 	case "nethernet":
 		network = "nethernet"
-		if strings.HasPrefix(host, "http://") || strings.HasPrefix(host, "https://") {
-			address = fmt.Sprintf("%s:%d", host, port)
+		if strings.HasPrefix(bm.host, "http://") || strings.HasPrefix(bm.host, "https://") {
+			address = fmt.Sprintf("%s:%d", bm.host, bm.port)
 		} else {
-			address = fmt.Sprintf("http://%s:%d", host, port)
+			address = fmt.Sprintf("http://%s:%d", bm.host, bm.port)
 		}
 	case "raknet":
 		network = "raknet"
-		address = fmt.Sprintf("%s:%d", host, port)
+		address = fmt.Sprintf("%s:%d", bm.host, bm.port)
 	default:
-		return fmt.Errorf("unsupported transport '%s' (use 'nethernet' or 'raknet')", transport)
+		return fmt.Errorf("unsupported transport '%s' (use 'nethernet' or 'raknet')", bm.transport)
 	}
 
-	dialCtx, dialCancel := context.WithTimeout(context.Background(), 25*time.Second)
+	dialCtx, dialCancel := context.WithTimeout(ctx, 25*time.Second)
 	defer dialCancel()
 
 	log.Printf("%s Connecting to %s [%s] (UUID: %s)...", prefix, address, network, botUUID)
@@ -187,6 +229,9 @@ func runBotSession(host string, port int, transport string, botName string, game
 	log.Printf("%s Bot Runtime Entity ID: %d, Spawn Coordinates: X=%.2f, Y=%.2f, Z=%.2f",
 		prefix, gameData.EntityRuntimeID, gameData.PlayerPosition.X(), gameData.PlayerPosition.Y(), gameData.PlayerPosition.Z())
 
+	// Report successful spawn to Control Center
+	bm.reportTelemetry(botName, "online", gameData.PlayerPosition.X(), gameData.PlayerPosition.Y(), gameData.PlayerPosition.Z(), gameData.Dimension, 0, "")
+
 	var posMu sync.RWMutex
 	currentPos := gameData.PlayerPosition
 	currentPitch := gameData.Pitch
@@ -196,7 +241,7 @@ func runBotSession(host string, port int, transport string, botName string, game
 	stopAuthInput := make(chan struct{})
 	defer close(stopAuthInput)
 
-	if enableAuthInput {
+	if bm.authInput {
 		go func() {
 			ticker := time.NewTicker(50 * time.Millisecond)
 			defer ticker.Stop()
@@ -251,6 +296,8 @@ func runBotSession(host string, port int, transport string, botName string, game
 					posMu.Unlock()
 					log.Printf("%s Position updated by server (/tp or move): X=%.2f, Y=%.2f, Z=%.2f (Yaw=%.1f)",
 						prefix, p.Position.X(), p.Position.Y(), p.Position.Z(), p.Yaw)
+					// Telemetry update on teleport or movement
+					bm.reportTelemetry(botName, "online", p.Position.X(), p.Position.Y(), p.Position.Z(), gameData.Dimension, 0, "")
 				}
 			case *packet.Disconnect:
 				log.Printf("%s Server sent Disconnect packet: %s", prefix, p.Message)
@@ -259,10 +306,265 @@ func runBotSession(host string, port int, transport string, botName string, game
 	}()
 
 	select {
-	case sig := <-sigChan:
-		log.Printf("%s Received signal %v. Disconnecting cleanly...", prefix, sig)
+	case <-ctx.Done():
+		log.Printf("%s Received cancellation. Disconnecting cleanly...", prefix)
 		return nil
 	case err := <-readErrChan:
 		return fmt.Errorf("read packet loop ended: %w", err)
 	}
+}
+
+// reportTelemetry sends live telemetry to Control Center
+func (bm *BotManager) reportTelemetry(botName string, status string, x, y, z float32, dimension int32, reconnectCount int, errMsg string) {
+	if bm.ctrlCenter == "" {
+		return
+	}
+
+	go func() {
+		payload := map[string]interface{}{
+			"botName":        botName,
+			"status":         status,
+			"x":              x,
+			"y":              y,
+			"z":              z,
+			"dimension":      dimension,
+			"reconnectCount": reconnectCount,
+			"error":          errMsg,
+		}
+
+		bodyBytes, _ := json.Marshal(payload)
+		client := &http.Client{Timeout: 4 * time.Second}
+		endpoint := fmt.Sprintf("%s/api/v1/agent/telemetry", bm.ctrlCenter)
+
+		resp, err := client.Post(endpoint, "application/json", bytes.NewBuffer(bodyBytes))
+		if err == nil && resp != nil {
+			_ = resp.Body.Close()
+		}
+	}()
+}
+
+// pollControlCenter periodically fetches the authoritative bot list from the Control Center
+func (bm *BotManager) pollControlCenter(ctx context.Context) {
+	if bm.ctrlCenter == "" {
+		return
+	}
+
+	ticker := time.NewTicker(15 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			endpoint := fmt.Sprintf("%s/api/v1/agent/bots", bm.ctrlCenter)
+			client := &http.Client{Timeout: 5 * time.Second}
+			resp, err := client.Get(endpoint)
+			if err != nil {
+				continue
+			}
+
+			var result struct {
+				Success bool `json:"success"`
+				Bots    []struct {
+					Name    string `json:"name"`
+					Enabled bool   `json:"enabled"`
+				} `json:"bots"`
+			}
+
+			if err := json.NewDecoder(resp.Body).Decode(&result); err == nil && result.Success {
+				var desired []string
+				for _, b := range result.Bots {
+					if b.Enabled {
+						desired = append(desired, b.Name)
+					}
+				}
+				if len(desired) > 0 {
+					bm.Sync(desired)
+				}
+			}
+			_ = resp.Body.Close()
+		}
+	}
+}
+
+func main() {
+	defaultHost := getEnv("HOST", "ayx.acido.dev")
+	defaultPort := 19132
+	defaultName := getEnv("BOT_NAME", "IronBot,IronBot2")
+	defaultTransport := getEnv("TRANSPORT", "nethernet")
+	defaultGameVersion := getEnv("GAME_VERSION", "1.26.61")
+	defaultAuthInput := getEnvBool("AUTH_INPUT", false)
+	defaultCtrlCenter := getEnv("CONTROL_CENTER_URL", "")
+
+	host := flag.String("host", defaultHost, "BDS server host or IP")
+	port := flag.Int("port", defaultPort, "BDS server port")
+	name := flag.String("name", defaultName, "Comma-separated bot player display name(s)")
+	transport := flag.String("transport", defaultTransport, "Transport network: 'nethernet' or 'raknet'")
+	gameVersion := flag.String("game-version", defaultGameVersion, "Game version string reported to server")
+	authInput := flag.Bool("auth-input", defaultAuthInput, "Send 20Hz PlayerAuthInput packets to simulate active movement")
+	ctrlCenter := flag.String("control-center", defaultCtrlCenter, "OUR SMP Control Center URL for dynamic synchronization")
+	flag.Parse()
+
+	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds)
+
+	var initialBotNames []string
+	for _, n := range strings.Split(*name, ",") {
+		n = strings.TrimSpace(n)
+		if n != "" {
+			initialBotNames = append(initialBotNames, n)
+		}
+	}
+	if len(initialBotNames) == 0 {
+		initialBotNames = []string{"IronBot"}
+	}
+
+	log.Printf("[System] Starting OUR SMP AFK Bot Service for Minecraft Bedrock")
+	log.Printf("[System] Initial Bots: %s", strings.Join(initialBotNames, ", "))
+	log.Printf("[System] Target: %s:%d (Transport: %s, GameVersion: %s)", *host, *port, *transport, *gameVersion)
+	if *ctrlCenter != "" {
+		log.Printf("[System] Control Center Integration: ACTIVE (%s)", *ctrlCenter)
+	}
+
+	rootCtx, rootCancel := context.WithCancel(context.Background())
+	defer rootCancel()
+
+	botManager := NewBotManager(rootCtx, *host, *port, *transport, *gameVersion, *authInput, *ctrlCenter)
+
+	// Start initial configured bots
+	botManager.Sync(initialBotNames)
+
+	// Background polling for changes from Control Center
+	if *ctrlCenter != "" {
+		go botManager.pollControlCenter(rootCtx)
+	}
+
+	// HTTP Web Server on Render PORT
+	webPort := os.Getenv("PORT")
+	if webPort == "" {
+		webPort = "8080"
+	}
+
+	mux := http.NewServeMux()
+
+	// 1. Health check & Render root
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		w.WriteHeader(http.StatusOK)
+		active := botManager.ActiveBotNames()
+		_, _ = fmt.Fprintf(w, "OUR SMP AFK Bot Worker is ACTIVE!\nRunning bots (%d): %s\nTarget: %s:%d\nTimestamp: %s\n",
+			len(active), strings.Join(active, ", "), *host, *port, time.Now().UTC().Format(time.RFC3339))
+	})
+
+	// 2. GET /api/bots - Returns active bot list
+	mux.HandleFunc("/api/bots", func(w http.ResponseWriter, r *http.Request) {
+		active := botManager.ActiveBotNames()
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": true,
+			"bots":    active,
+			"count":   len(active),
+		})
+	})
+
+	// 3. POST /api/bots/sync - Receives desired list from Control Center and synchronizes immediately
+	mux.HandleFunc("/api/bots/sync", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var req struct {
+			Bots []string `json:"bots"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid JSON body", http.StatusBadRequest)
+			return
+		}
+
+		if len(req.Bots) > 0 {
+			log.Printf("[HTTP] Received dynamic bot sync request with %d bots: %v", len(req.Bots), req.Bots)
+			botManager.Sync(req.Bots)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": true,
+			"active":  botManager.ActiveBotNames(),
+		})
+	})
+
+	// 4. POST /api/bots/add - Dynamically add a single bot
+	mux.HandleFunc("/api/bots/add", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			Name string `json:"name"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Name == "" {
+			http.Error(w, "Valid 'name' is required", http.StatusBadRequest)
+			return
+		}
+
+		started := botManager.StartBot(req.Name)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": started,
+			"name":    req.Name,
+			"active":  botManager.ActiveBotNames(),
+		})
+	})
+
+	// 5. POST /api/bots/remove - Dynamically stop a single bot
+	mux.HandleFunc("/api/bots/remove", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			Name string `json:"name"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Name == "" {
+			http.Error(w, "Valid 'name' is required", http.StatusBadRequest)
+			return
+		}
+
+		stopped := botManager.StopBot(req.Name)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": stopped,
+			"name":    req.Name,
+			"active":  botManager.ActiveBotNames(),
+		})
+	})
+
+	go func() {
+		log.Printf("[System] Health check & Management API server listening on :%s", webPort)
+		_ = http.ListenAndServe(":"+webPort, mux)
+	}()
+
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+
+	<-sigChan
+	log.Printf("[System] Shutdown signal received. Disconnecting all bots cleanly...")
+	rootCancel()
+	log.Printf("[System] All bots stopped safely. Exiting.")
+}
+
+func getEnv(key, defaultVal string) string {
+	if val := os.Getenv(key); val != "" {
+		return val
+	}
+	return defaultVal
+}
+
+func getEnvBool(key string, defaultVal bool) bool {
+	val := os.Getenv(key)
+	if val == "" {
+		return defaultVal
+	}
+	return strings.ToLower(val) == "true" || val == "1"
 }

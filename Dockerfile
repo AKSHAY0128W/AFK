@@ -35,6 +35,7 @@ ENV HOST=ayx.acido.dev \
     BOT_NAME=IronBot,IronBot2 \
     TRANSPORT=nethernet \
     GAME_VERSION=1.26.61 \
-    AUTH_INPUT=false
+    AUTH_INPUT=false \
+    CONTROL_CENTER_URL=""
 
-ENTRYPOINT ["sh", "-c", "exec /usr/local/bin/ironbot -host \"$HOST\" -port \"$MINECRAFT_PORT\" -name \"$BOT_NAME\" -transport \"$TRANSPORT\" -game-version \"$GAME_VERSION\" -auth-input=$AUTH_INPUT"]
+ENTRYPOINT ["sh", "-c", "exec /usr/local/bin/ironbot -host \"$HOST\" -port \"$MINECRAFT_PORT\" -name \"$BOT_NAME\" -transport \"$TRANSPORT\" -game-version \"$GAME_VERSION\" -auth-input=$AUTH_INPUT -control-center \"$CONTROL_CENTER_URL\""]
