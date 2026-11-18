@@ -427,10 +427,6 @@ func main() {
 			}
 		}
 	}
-	// Only default to IronBot if NO control center is configured AND no bot name was specified
-	if len(initialBotNames) == 0 && *ctrlCenter == "" {
-		initialBotNames = []string{"IronBot"}
-	}
 
 	log.Printf("[System] Starting OUR SMP AFK Bot Service for Minecraft Bedrock")
 	log.Printf("[System] Initial Bots: %s", strings.Join(initialBotNames, ", "))
