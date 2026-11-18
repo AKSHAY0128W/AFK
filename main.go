@@ -218,6 +218,17 @@ func (bm *BotManager) runBotSession(ctx context.Context, botName string) error {
 	}
 	defer conn.Close()
 
+	// Ensure connection is immediately closed the moment context is canceled
+	closeConnOnDone := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = conn.Close()
+		case <-closeConnOnDone:
+		}
+	}()
+	defer close(closeConnOnDone)
+
 	log.Printf("%s Connected to %s. Handshaking and completing spawn sequence (DoSpawn)...", prefix, conn.RemoteAddr())
 	if err := conn.DoSpawn(); err != nil {
 		return fmt.Errorf("spawn sequence (DoSpawn) failed: %w", err)
@@ -379,9 +390,8 @@ func (bm *BotManager) pollControlCenter(ctx context.Context) {
 						desired = append(desired, b.Name)
 					}
 				}
-				if len(desired) > 0 {
-					bm.Sync(desired)
-				}
+				log.Printf("[BotManager] Polled Control Center: desired active bots = %v", desired)
+				bm.Sync(desired)
 			}
 			_ = resp.Body.Close()
 		}
@@ -391,7 +401,7 @@ func (bm *BotManager) pollControlCenter(ctx context.Context) {
 func main() {
 	defaultHost := getEnv("HOST", "ayx.acido.dev")
 	defaultPort := 19132
-	defaultName := getEnv("BOT_NAME", "IronBot,IronBot2")
+	defaultName := getEnv("BOT_NAME", "")
 	defaultTransport := getEnv("TRANSPORT", "nethernet")
 	defaultGameVersion := getEnv("GAME_VERSION", "1.26.61")
 	defaultAuthInput := getEnvBool("AUTH_INPUT", false)
@@ -409,13 +419,16 @@ func main() {
 	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds)
 
 	var initialBotNames []string
-	for _, n := range strings.Split(*name, ",") {
-		n = strings.TrimSpace(n)
-		if n != "" {
-			initialBotNames = append(initialBotNames, n)
+	if *name != "" {
+		for _, n := range strings.Split(*name, ",") {
+			n = strings.TrimSpace(n)
+			if n != "" {
+				initialBotNames = append(initialBotNames, n)
+			}
 		}
 	}
-	if len(initialBotNames) == 0 {
+	// Only default to IronBot if NO control center is configured AND no bot name was specified
+	if len(initialBotNames) == 0 && *ctrlCenter == "" {
 		initialBotNames = []string{"IronBot"}
 	}
 
@@ -482,10 +495,8 @@ func main() {
 			return
 		}
 
-		if len(req.Bots) > 0 {
-			log.Printf("[HTTP] Received dynamic bot sync request with %d bots: %v", len(req.Bots), req.Bots)
-			botManager.Sync(req.Bots)
-		}
+		log.Printf("[HTTP] Received dynamic bot sync request with %d bots: %v", len(req.Bots), req.Bots)
+		botManager.Sync(req.Bots)
 
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
