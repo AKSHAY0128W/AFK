@@ -223,6 +223,9 @@ func (bm *BotManager) runBotSession(ctx context.Context, botName string) error {
 	go func() {
 		select {
 		case <-ctx.Done():
+			_ = conn.WritePacket(&packet.Disconnect{
+				Message: "Disconnected by AFK Bot Manager",
+			})
 			_ = conn.Close()
 		case <-closeConnOnDone:
 		}
