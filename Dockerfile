@@ -32,10 +32,10 @@ USER botuser
 # Default environment variables
 ENV HOST=ayx.acido.dev \
     MINECRAFT_PORT=19132 \
-    BOT_NAME=IronBot,IronBot2 \
+    BOT_NAME="" \
     TRANSPORT=nethernet \
     GAME_VERSION=1.26.61 \
     AUTH_INPUT=false \
-    CONTROL_CENTER_URL=""
+    CONTROL_CENTER_URL="https://our-smp-control-center.onrender.com"
 
 ENTRYPOINT ["sh", "-c", "exec /usr/local/bin/ironbot -host \"$HOST\" -port \"$MINECRAFT_PORT\" -name \"$BOT_NAME\" -transport \"$TRANSPORT\" -game-version \"$GAME_VERSION\" -auth-input=$AUTH_INPUT -control-center \"$CONTROL_CENTER_URL\""]

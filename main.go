@@ -363,6 +363,38 @@ func (bm *BotManager) pollControlCenter(ctx context.Context) {
 		return
 	}
 
+	fetchAndSync := func() {
+		endpoint := fmt.Sprintf("%s/api/v1/agent/bots", bm.ctrlCenter)
+		client := &http.Client{Timeout: 5 * time.Second}
+		resp, err := client.Get(endpoint)
+		if err != nil {
+			return
+		}
+		defer resp.Body.Close()
+
+		var result struct {
+			Success bool `json:"success"`
+			Bots    []struct {
+				Name    string `json:"name"`
+				Enabled bool   `json:"enabled"`
+			} `json:"bots"`
+		}
+
+		if err := json.NewDecoder(resp.Body).Decode(&result); err == nil && result.Success {
+			var desired []string
+			for _, b := range result.Bots {
+				if b.Enabled {
+					desired = append(desired, b.Name)
+				}
+			}
+			log.Printf("[BotManager] Polled Control Center: desired active bots = %v", desired)
+			bm.Sync(desired)
+		}
+	}
+
+	// Run immediate sync on start
+	fetchAndSync()
+
 	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
 
@@ -371,32 +403,7 @@ func (bm *BotManager) pollControlCenter(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			endpoint := fmt.Sprintf("%s/api/v1/agent/bots", bm.ctrlCenter)
-			client := &http.Client{Timeout: 5 * time.Second}
-			resp, err := client.Get(endpoint)
-			if err != nil {
-				continue
-			}
-
-			var result struct {
-				Success bool `json:"success"`
-				Bots    []struct {
-					Name    string `json:"name"`
-					Enabled bool   `json:"enabled"`
-				} `json:"bots"`
-			}
-
-			if err := json.NewDecoder(resp.Body).Decode(&result); err == nil && result.Success {
-				var desired []string
-				for _, b := range result.Bots {
-					if b.Enabled {
-						desired = append(desired, b.Name)
-					}
-				}
-				log.Printf("[BotManager] Polled Control Center: desired active bots = %v", desired)
-				bm.Sync(desired)
-			}
-			_ = resp.Body.Close()
+			fetchAndSync()
 		}
 	}
 }
@@ -408,7 +415,7 @@ func main() {
 	defaultTransport := getEnv("TRANSPORT", "nethernet")
 	defaultGameVersion := getEnv("GAME_VERSION", "1.26.61")
 	defaultAuthInput := getEnvBool("AUTH_INPUT", false)
-	defaultCtrlCenter := getEnv("CONTROL_CENTER_URL", "")
+	defaultCtrlCenter := getEnv("CONTROL_CENTER_URL", "https://our-smp-control-center.onrender.com")
 
 	host := flag.String("host", defaultHost, "BDS server host or IP")
 	port := flag.Int("port", defaultPort, "BDS server port")
@@ -425,7 +432,7 @@ func main() {
 	if *name != "" {
 		for _, n := range strings.Split(*name, ",") {
 			n = strings.TrimSpace(n)
-			if n != "" {
+			if n != "" && n != "IronBot" && n != "IronBot2" {
 				initialBotNames = append(initialBotNames, n)
 			}
 		}
