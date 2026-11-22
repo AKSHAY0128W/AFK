@@ -92,6 +92,36 @@ func (bm *BotManager) Sync(desiredNames []string) {
 	}
 }
 
+// UpdateTarget updates the BDS host/port dynamically and restarts active workers if changed
+func (bm *BotManager) UpdateTarget(newHost string, newPort int) {
+	bm.mu.Lock()
+	defer bm.mu.Unlock()
+
+	newHost = strings.TrimSpace(newHost)
+	if newHost == "" || newPort <= 0 {
+		return
+	}
+
+	if bm.host == newHost && bm.port == newPort {
+		return
+	}
+
+	log.Printf("[BotManager] Target BDS server changed: %s:%d -> %s:%d. Reconnecting running bots...", bm.host, bm.port, newHost, newPort)
+	bm.host = newHost
+	bm.port = newPort
+
+	// Cancel existing bot sessions so they reconnect to the new host/port
+	for name, cancel := range bm.workers {
+		log.Printf("[BotManager] Restarting bot %s to connect to new server %s:%d", name, newHost, newPort)
+		cancel()
+		delete(bm.workers, name)
+
+		botCtx, botCancel := context.WithCancel(bm.rootCtx)
+		bm.workers[name] = botCancel
+		go bm.runBotWorker(botCtx, name)
+	}
+}
+
 // StopBot cancels a specific bot by name
 func (bm *BotManager) StopBot(name string) bool {
 	bm.mu.Lock()
@@ -374,20 +404,27 @@ func (bm *BotManager) pollControlCenter(ctx context.Context) {
 
 		var result struct {
 			Success bool `json:"success"`
-			Bots    []struct {
+			Server  struct {
+				Host string `json:"host"`
+				Port int    `json:"port"`
+			} `json:"server"`
+			Bots []struct {
 				Name    string `json:"name"`
 				Enabled bool   `json:"enabled"`
 			} `json:"bots"`
 		}
 
 		if err := json.NewDecoder(resp.Body).Decode(&result); err == nil && result.Success {
+			if result.Server.Host != "" && result.Server.Port > 0 {
+				bm.UpdateTarget(result.Server.Host, result.Server.Port)
+			}
 			var desired []string
 			for _, b := range result.Bots {
 				if b.Enabled {
 					desired = append(desired, b.Name)
 				}
 			}
-			log.Printf("[BotManager] Polled Control Center: desired active bots = %v", desired)
+			log.Printf("[BotManager] Polled Control Center: desired active bots = %v (Target BDS: %s:%d)", desired, bm.host, bm.port)
 			bm.Sync(desired)
 		}
 	}
@@ -495,13 +532,19 @@ func main() {
 
 		var req struct {
 			Bots []string `json:"bots"`
+			Host string   `json:"host,omitempty"`
+			Port int      `json:"port,omitempty"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, "Invalid JSON body", http.StatusBadRequest)
 			return
 		}
 
-		log.Printf("[HTTP] Received dynamic bot sync request with %d bots: %v", len(req.Bots), req.Bots)
+		if req.Host != "" && req.Port > 0 {
+			botManager.UpdateTarget(req.Host, req.Port)
+		}
+
+		log.Printf("[HTTP] Received dynamic bot sync request with %d bots (Target: %s:%d): %v", len(req.Bots), botManager.host, botManager.port, req.Bots)
 		botManager.Sync(req.Bots)
 
 		w.Header().Set("Content-Type", "application/json")
